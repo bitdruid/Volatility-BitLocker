@@ -1,29 +1,61 @@
-import volatility.plugins.common as common
-import volatility.utils as utils
-import volatility.obj as obj
-import volatility.win32.tasks as tasks
-from volatility.renderers import TreeGrid
-from volatility.renderers.basic import Address
-import volatility.poolscan as poolscan
+from volatility3.framework import interfaces, renderers, objects, symbols, constants
+from volatility3.framework.configuration import requirements
+from volatility3.framework.renderers import format_hints
+from volatility3.plugins import windows
 import binascii
 import os
 
-
-class KeyPoolScan(poolscan.SinglePoolScanner):
-    """ Pool scanner """
-
-
-class Bitlocker(common.AbstractWindowsCommand):
+class Bitlocker(interfaces.plugins.PluginInterface):
     """Extract Bitlocker FVEK. Supports Windows 7 - 10."""
 
-    def __init__(self, config, *args, **kwargs):
-        common.AbstractWindowsCommand.__init__(self, config, *args, **kwargs)
-        config.add_option('DUMP-DIR', default=None, help='Directory in which to dump FVEK (can be used for bdemount)')
-        config.add_option('DISLOCKER', default=None, help='Directory in which to dump FVEK for Dislocker')
-        config.add_option('VERBOSE', default=None, help='Add more information')
-        config.add_option('DEBUG', default=None, help='Here to Debug offset')
+    _version = (1, 0, 0)
+    _required_framework_version = (2, 0, 0)
 
-    def calculate(self):
+    @classmethod
+    def get_requirements(cls):
+        return [
+            requirements.TranslationLayerRequirement(
+                name='primary', description="Memory layer for the kernel", architectures=["Intel32", "Intel64"]
+            ),
+            requirements.SymbolTableRequirement(
+                name='nt_symbols', description="Windows kernel symbols"
+            ),
+            requirements.StringRequirement(name='dump_dir', description="Directory to dump FVEK", default=None, optional=True),
+            requirements.StringRequirement(name='dislocker_dir', description="Directory to dump FVEK for Dislocker", default=None, optional=True),
+            requirements.BooleanRequirement(
+                name='verbose', description="Enable verbose output", default=False, optional=True
+            ),
+            requirements.BooleanRequirement(
+                name='debug', description="Enable debug output", default=False, optional=True
+            ),
+        ]
+
+    def run(self):
+        layer_name = self.config['primary']
+        symbol_table = self.config['nt_symbols']
+
+        # Create the kernel module if needed
+        kernel = self.context.module(symbol_table, layer_name, offset=0)
+
+        is_64bit = symbols.symbol_table_is_64bit(self.context, symbol_table)
+
+        if is_64bit:
+            kuser_shared_data_addr = 0xFFFFF78000000000
+        else:
+            kuser_shared_data_addr = 0xFFDF0000
+
+        kuser_shared_data = self.context.object(
+            symbol_table + constants.BANG + "_KUSER_SHARED_DATA",
+            layer_name=layer_name,
+            offset=kuser_shared_data_addr,
+        )
+
+        major_version = int(kuser_shared_data.NtMajorVersion)
+        minor_version = int(kuser_shared_data.NtMinorVersion)
+        build_number = int(kuser_shared_data.NtBuildNumber & 0xFFFF)
+
+        winver = (major_version, minor_version, build_number)
+
         PoolSize = {
             'Fvec128': 508,
             'Fvec256': 1008,
@@ -43,222 +75,141 @@ class Bitlocker(common.AbstractWindowsCommand):
             '40': 'AES-XTS 256 bit (Win 10+)',
         }
 
-        address_space = utils.load_as(self._config)
-        winver = (address_space.profile.metadata.get("major", 0), address_space.profile.metadata.get("minor", 0),
-                  address_space.profile.metadata.get("build"))
-        arch = address_space.profile.metadata.get("memory_model", 0)
+        results = []
 
         if winver >= (6, 4, 10241):
             mode = "30"
-            if self._config.VERBOSE:
-                print(
-                    "\n[INFO] Looking for some FVEKs inside memory pools used by BitLocker in Windows 10/2016/2019.\n")
+            if self.config.get('verbose', False):
+                self._log_info(
+                    "Looking for FVEKs inside memory pools used by BitLocker in Windows 10/2016/2019."
+                )
             tweak = "Not Applicable"
-            poolsize = lambda x: x >= PoolSize['None128'] and x <= PoolSize['None256']
-            scanner = KeyPoolScan()
-            scanner.checks = [
-                ('PoolTagCheck', dict(tag="None")),
-                ('CheckPoolSize', dict(condition=poolsize)),
-                ('CheckPoolType', dict(paged=False, non_paged=True)),
+
+            constraints = [
+                windows.poolscanner.PoolConstraint(
+                    tag=b'None',
+                    type_name=symbol_table + constants.BANG + '_POOL_HEADER',
+                    page_type=windows.poolscanner.PoolType.NONPAGED,
+                    size=(PoolSize['None128'], PoolSize['None256']),
+                    skip_type_test=True,
+                )
             ]
-            if (arch == '64bit'):
-                fvek1OffsetRel = 0x9c
-                fvek2OffsetRel = 0xe0
-                fvek3OffsetRel = 0xc0  # Just for W2016 and W2019 using AES-CBC encryption method
-            for offset in scanner.scan(address_space):
-                pool = obj.Object("_POOL_HEADER", offset=offset, vm=address_space)
-                f1 = address_space.zread(offset + fvek1OffsetRel, 64)
-                f2 = address_space.zread(offset + fvek2OffsetRel, 64)
-                f3 = address_space.zread(offset + fvek3OffsetRel, 64)
-                if f1[0:16] == f2[0:16]:
+
+            # Adjust alignment based on architecture
+            alignment = 0x10 if is_64bit else 8
+
+            # Use the pool_scan class method directly
+            for constraint, header in windows.poolscanner.PoolScanner.pool_scan(
+                context=self.context,
+                layer_name=layer_name,
+                symbol_table=symbol_table,
+                pool_constraints=constraints,
+                alignment=alignment,
+                progress_callback=self._progress_callback
+            ):
+                pool_offset = header.vol.offset
+                pool_size = alignment * header.BlockSize
+
+                # Read the pool data
+                data = self.context.layers[layer_name].read(
+                    pool_offset, pool_size
+                )
+
+                if is_64bit:
+                    fvek1OffsetRel = 0x9C
+                    fvek2OffsetRel = 0xE0
+                    fvek3OffsetRel = 0xC0  # For AES-CBC encryption method
+                else:
+                    # For 32-bit architectures (update offsets accordingly)
+                    fvek1OffsetRel = 0x6C
+                    fvek2OffsetRel = 0xB0
+                    fvek3OffsetRel = 0x90
+
+                f1 = data[fvek1OffsetRel:fvek1OffsetRel + 64]
+                f2 = data[fvek2OffsetRel:fvek2OffsetRel + 64]
+                f3 = data[fvek3OffsetRel:fvek3OffsetRel + 64]
+
+                # Extract and validate FVEKs
+                if f1[:16] == f2[:16]:
                     if f1[16:32] == f2[16:32]:
-                        if self._config.DISLOCKER:
-                            fbis = binascii.unhexlify("04") + binascii.unhexlify("80") + f1
-                            yield pool, BLMode['40'], tweak, f1[0:32], [fbis]
-                        else:
-                            yield pool, BLMode['40'], tweak, f1[0:32], []
+                        cipher_mode = '40'
+                        fvek_length = 32
                     else:
-                        if self._config.DISLOCKER:
-                            fbis = binascii.unhexlify("05") + binascii.unhexlify("80") + f1
-                            yield pool, BLMode['30'], tweak, f1[0:16], [fbis]
-                        else:
-                            yield pool, BLMode['30'], tweak, f1[0:16], []
-                if f1[0:16] == f3[0:16]:  # Should be AES-CBC
+                        cipher_mode = '30'
+                        fvek_length = 16
+
+                    fvek = f1[:fvek_length]
+                    dislocker_data = None
+                    if self.config.get('dislocker', None):
+                        prefix = b'\x04' if cipher_mode == '40' else b'\x05'
+                        dislocker_data = prefix + b'\x80' + f1
+                    results.append(
+                        (pool_offset, BLMode[cipher_mode], tweak, fvek, dislocker_data)
+                    )
+                elif f1[:16] == f3[:16]:
                     if f1[16:32] == f3[16:32]:
-                        if self._config.DISLOCKER:
-                            fbis = binascii.unhexlify("03") + binascii.unhexlify("80") + f1
-                            yield pool, BLMode['20'], tweak, f1[0:32], [fbis]
-                        else:
-                            yield pool, BLMode['20'], tweak, f1[0:32], []
+                        cipher_mode = '20'
+                        fvek_length = 32
                     else:
-                        if self._config.DISLOCKER:
-                            fbis = binascii.unhexlify("02") + binascii.unhexlify("80") + f1
-                            yield pool, BLMode['10'], tweak, f1[0:16], [fbis]
-                        else:
-                            yield pool, BLMode['10'], tweak, f1[0:16], []
-                if self._config.DEBUG:
-                    fvek = []
-                    print("---------- START ----------")
-                    for o, h, c in utils.Hexdump(f1):
-                        fvek.append(h)
-                    print(fvek)
-                    fvek = []
-                    for o, h, c in utils.Hexdump(f2):
-                        fvek.append(h)
-                    print(fvek)
-                    fvek = []
-                    for o, h, c in utils.Hexdump(f3):
-                        fvek.append(h)
-                    print(fvek)
+                        cipher_mode = '10'
+                        fvek_length = 16
 
-        if winver >= (6, 2):
-            if self._config.VERBOSE:
-                print(
-                    "\n[INFO] Looking for some FVEKs inside memory pools used by BitLocker in Windows 8/8.1/2012/older 10 versions.\n")
-            tweak = "Not Applicable"
-            poolsize = lambda x: x >= PoolSize['Cngb128'] and x <= PoolSize['Cngb256']
-            scanner = KeyPoolScan()
-            scanner.checks = [
-                ('PoolTagCheck', dict(tag="Cngb")),
-                ('CheckPoolSize', dict(condition=poolsize)),
-                ('CheckPoolType', dict(paged=False, non_paged=True)),
-            ]
+                    fvek = f1[:fvek_length]
+                    dislocker_data = None
+                    if self.config.get('dislocker', None):
+                        prefix = b'\x03' if cipher_mode == '20' else b'\x02'
+                        dislocker_data = prefix + b'\x80' + f1
+                    results.append(
+                        (pool_offset, BLMode[cipher_mode], tweak, fvek, dislocker_data)
+                    )
 
-            if (arch == '32bit'):
-                modeOffsetRel = 0x5C
-                fvek1OffsetRel = 0x4C
-                fvek2OffsetRel = 0x9C
+                if self.config.get('debug', False):
+                    self._log_debug(f"Pool Offset: {hex(pool_offset)}")
+                    self._log_debug(f"f1: {binascii.hexlify(f1)}")
+                    self._log_debug(f"f2: {binascii.hexlify(f2)}")
+                    self._log_debug(f"f3: {binascii.hexlify(f3)}")
+        else:
+            # Handle other Windows versions accordingly
+            self._log_info("Windows version not supported by this plugin.")
+            return
 
-            if (arch == '64bit'):
-                modeOffsetRel = 0x68
-                fvek1OffsetRel = 0x6C
-                fvek2OffsetRel = 0x90
+        return renderers.TreeGrid(
+            [
+                ("Address", format_hints.Hex),
+                ("Cipher", str),
+                ("FVEK", str),
+                ("Tweak Key", str),
+            ],
+            self._generator(results),
+        )
 
-            for offset in scanner.scan(address_space):
-                pool = obj.Object("_POOL_HEADER", offset=offset, vm=address_space)
-                f1 = address_space.zread(offset + fvek1OffsetRel, 64)
-                f2 = address_space.zread(offset + fvek2OffsetRel, 64)
-                if f1[0:16] == f2[0:16]:
-                    if f1[16:32] == f2[16:32]:
-                        if self._config.DISLOCKER:
-                            fbis = binascii.unhexlify("03") + binascii.unhexlify("80") + f1
-                            yield pool, BLMode['20'], tweak, f1[0:32], [fbis]
-                        else:
-                            yield pool, BLMode['20'], tweak, f1[0:32], []
-                    else:
-                        if self._config.DISLOCKER:
-                            fbis = binascii.unhexlify("02") + binascii.unhexlify("80") + f1
-                            yield pool, BLMode['10'], tweak, f1[0:16], [fbis]
-                        else:
-                            yield pool, BLMode['10'], tweak, f1[0:16], []
-        if winver >= (6, 0):
-
-            POOLSIZE_X86_AESDIFF = 976
-            POOLSIZE_X86_AESONLY = 504
-            POOLSIZE_X64_AESDIFF = 1008
-            POOLSIZE_X64_AESONLY = 528
-
-            OFFSET_DB = {
-                POOLSIZE_X86_AESDIFF: {
-                    'CID': 24,
-                    'FVEK1': 32,
-                    'FVEK2': 504
-                },
-                POOLSIZE_X86_AESONLY: {
-                    'CID': 24,
-                    'FVEK1': 32,
-                    'FVEK2': 336
-                },
-                POOLSIZE_X64_AESDIFF: {
-                    'CID': 44,
-                    'FVEK1': 48,
-                    'FVEK2': 528
-                },
-                POOLSIZE_X64_AESONLY: {
-                    'CID': 44,
-                    'FVEK1': 48,
-                    'FVEK2': 480
-                },
-            }
-
-            addr_space = utils.load_as(self._config)
-
-            scanner = poolscan.SinglePoolScanner()
-            scanner.checks = [
-                ('PoolTagCheck', dict(tag='FVEc')),
-                ('CheckPoolSize', dict(condition=lambda x: x in list(OFFSET_DB.keys()))),
-            ]
-
-            for addr in scanner.scan(addr_space):
-                pool = obj.Object('_POOL_HEADER', offset=addr, vm=addr_space)
-
-                pool_alignment = obj.VolMagic(pool.obj_vm).PoolAlignment.v()
-                pool_size = int(pool.BlockSize * pool_alignment)
-
-                cid = addr_space.zread(addr + OFFSET_DB[pool_size]['CID'], 2)
-                fvek1 = addr_space.zread(addr + OFFSET_DB[pool_size]['FVEK1'], 32)
-                fvek2 = addr_space.zread(addr + OFFSET_DB[pool_size]['FVEK2'], 32)
-
-                if ord(cid[1]) == 0x80 and ord(cid[0]) <= 0x03:
-                    if ord(cid[0])==0x02 or ord(cid[0])==0x00:
-                        length = 16
-                    else:
-                        length=32
-                    fvek = fvek1 + fvek2
-                    mode = '{:02x}'.format(ord(cid[0]))
-                    yield pool, BLMode[mode], fvek2[0:length] if mode!="02" and mode!="03" else "Not Applicable", fvek1[0:length], [binascii.unhexlify(mode) + binascii.unhexlify("80") + fvek]
-
-    def unified_output(self, data):
-        return TreeGrid([("Address", Address),
-                         ("Cipher", str),
-                         ("FVEK", str),
-                         ("TWEAK Key", str),
-                         ], self.generator(data))
-
-    def generator(self, data):
-        for (pool, BLMode, tweak, fvek_raw, fbis) in data:
-            fvek = []
-            for o, h, c in utils.Hexdump(fvek_raw):
-                fvek.append(h)
+    def _generator(self, data):
+        for (pool_offset, cipher, tweak, fvek_raw, dislocker_data) in data:
+            fvek = binascii.hexlify(fvek_raw).decode('utf-8')
             yield (
-                0, [Address(pool), BLMode, str(''.join(fvek).replace(" ", "")), str(''.join(tweak).replace(" ", "")), ])
+                0,
+                (
+                    format_hints.Hex(pool_offset),
+                    cipher,
+                    fvek,
+                    tweak,
+                ),
+            )
+            # Handle dumping of FVEK files
+            if self.config.get('dump_dir', None):
+                dump_path = os.path.join(
+                    self.config['dump_dir'], f"{pool_offset:#x}.fvek"
+                )
+                with open(dump_path, "w") as f:
+                    f.write(fvek + "\n")
+                self._log_info(f"FVEK dumped to file: {dump_path}")
 
-    def render_text(self, outfd, data):
-        for (pool, BLMode, tweak_raw, fvek_raw, fbis) in data:
-            fvek = []
-            for o, h, c in utils.Hexdump(fvek_raw):
-                fvek.append(h)
-            if tweak_raw != "Not Applicable":
-                tweak = []
-                for o, h, c in utils.Hexdump(tweak_raw):
-                    tweak.append(h)
-            else:
-                tweak = tweak_raw
-            if tweak != "Not Applicable":
-                outfd.write("\n" +
-                            "[FVEK] Address : " + '{0:#010x}'.format(pool.obj_offset) + "\n" +
-                            "[FVEK] Cipher  : " + BLMode + "\n" +
-                            "[FVEK] FVEK    : " + ''.join(fvek).replace(" ", "") + "\n" +
-                            "[FVEK] Tweak   : " + ''.join(tweak).replace(" ", "") + "\n")
-            else:
-                outfd.write("\n" +
-                            "[FVEK] Address : " + '{0:#010x}'.format(pool.obj_offset) + "\n" +
-                            "[FVEK] Cipher  : " + BLMode + "\n" +
-                            "[FVEK] FVEK: " + ''.join(fvek).replace(" ", "") + "\n")
-            if self._config.DUMP_DIR:
-                full_path = os.path.join(self._config.DUMP_DIR, '{0:#010x}.fvek'.format(pool.obj_offset))
-                with open(full_path, "wb") as fvek_file:
-                    if tweak == "Not Applicable":
-                        fvek_file.write(''.join(fvek).replace(" ", "") + "\n")
-                    else:
-                        fvek_file.write(''.join(fvek).replace(" ", "") + ":" + ''.join(tweak).replace(" ", "") +"\n")
-                outfd.write('[DUMP] FVEK dumped to file: {}\n'.format(full_path))
-            if self._config.DISLOCKER:
-                full_path_dislocker = os.path.join(self._config.DISLOCKER,
-                                                   '{0:#010x}-Dislocker.fvek'.format(pool.obj_offset))
-                with open(full_path_dislocker, "wb") as fvek_file_dis:
-                    if fbis != []:
-                        fvek_file_dis.write(fbis[0])
-                        outfd.write('[DISL] FVEK for Dislocker dumped to file: {}\n'.format(full_path_dislocker))
-            if self._config.DISLOCKER or self._config.DUMP_DIR:
-                print('\n')
+            if dislocker_data and self.config.get('dislocker', None):
+                dislocker_path = os.path.join(
+                    self.config['dislocker'], f"{pool_offset:#x}-Dislocker.fvek"
+                )
+                with open(dislocker_path, "wb") as f:
+                    f.write(dislocker_data)
+                self._log_info(
+                    f"FVEK for Dislocker dumped to file: {dislocker_path}"
+                )
